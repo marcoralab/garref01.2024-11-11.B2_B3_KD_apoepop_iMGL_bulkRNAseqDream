@@ -1,0 +1,641 @@
+---
+title: "garref01.2024-11-11.B2_B3_KD_apoepop_iMGL_bulkRNAseqDream"
+author: "Brian Fulton-Howard and Francesca Garretti"
+format:
+  html:
+    toc: true
+    df-print: paged
+    embed-resources: true
+editor: 
+  markdown: 
+    wrap: 72
+---
+
+## Experimental design
+
+### B2 B3 KD apoe pop iMGL bulk RNASeq
+
+96 samples total
+
+- APOE: 4 lines
+    - 33 = ID1, ID3, ID4, ID6
+    - 44 = ID8, ID9, ID11, ID13
+- siRNA: 3 genotypes
+    - SCR
+    - B2
+    - B3
+- stimulus
+    - none
+    - THPG
+- expt (two experiments/line)
+    - 1
+    - 2
+
+## Setup environment
+
+```{r}
+#| output: false
+suppressPackageStartupMessages(library(dplyr))
+library(readr)
+library(tibble)
+library(tidyr)
+library(stringr)
+library(forcats)
+library(variancePartition)
+library(BiocParallel)
+library(edgeR)
+library(fgsea)
+library(readxl)
+library(writexl)
+library(ggplot2)
+library(ggpubr)
+#library(DOSE)
+library(ggrepel)
+library(furrr)
+library(purrr)
+library(future)
+library(plotly)
+
+set.seed(1969)
+theme_set(theme_minimal())
+register(MulticoreParam(workers=64))
+plan(multisession, workers = 64)
+
+dgea_label <- function(res) {
+  if (nrow(res) == 0) return(res)
+  res$diffexpressed <- "NO"
+  # if log2Foldchange > 1 and pvalue < 0.05, set as "UP" 
+  res$diffexpressed[res$logFC > 1 & res$adj.P.Val < 0.05] <- "UP"
+  # if log2Foldchange < -1 and pvalue < 0.05, set as "DOWN"
+  res$diffexpressed[res$logFC < -1 & res$adj.P.Val < 0.05] <- "DOWN"
+  # Now write down the name of genes beside the points...
+  res$label <- NA_character_
+  res$label[res$diffexpressed != "NO"] <-
+    res$gene_name[res$diffexpressed != "NO"]
+  return(res)
+}
+plot_volcano <- function(tab, t) {
+  if (nrow(tab) > 0) {
+    ggplot(data=tab, aes(x=logFC, y=-log10(adj.P.Val), color = diffexpressed, label=label)) +
+      geom_point() + 
+      scale_color_manual(values=c("#0006b1", "grey", "#bb0c00")) +
+      geom_vline(xintercept=c(-1, 1), col="grey", linetype = 'dashed') +
+      geom_hline(yintercept=-log10(0.05), col="grey", linetype = 'dashed') +
+      theme_minimal() +
+      geom_label_repel( max.overlaps = 30) +
+      ylab(expression("-log"[10]*"Adjusted p-value")) +
+      xlab(expression("log"[2]*"FC")) +
+      theme_pubr() +
+      theme(legend.position ="none") +
+      labs_pubr()+
+      labs(title = t) +
+      theme(plot.title = element_text(hjust = 0.4))
+  } else {
+    ggplot() +
+     annotate("text", x = 0.5, y = 0.5, size = 8,
+              label = sprintf("No significant genes for %s", t)) +
+     theme_void()
+  }
+}
+
+datapath <- "/sc/arion/projects/load/users/goateomics/garref01/garref01.2024-11-11.B2_B3_KD_apoepop_iMGL_bulkRNAseq"
+dir.create("output", showWarnings = FALSE, recursive = TRUE)
+dir.create("input", showWarnings = FALSE)
+dir.create("shiny/www", showWarnings = FALSE)
+```
+
+## Get protein coding genes from GENCODE GTF
+
+Ensure that the gencode version of the GTF read in here matches that of
+the gtf used for STAR/Salmon, or things will not work properly.
+
+```{r}
+read_gtf <- function(gtf_fname) {
+  rtracklayer::import(gtf_fname) |>
+    as_tibble() |>
+    select(type, gene_type, gene_id, gene_name, transcript_id, transcript_name)
+}
+
+gencode45_gtf <- read_gtf("data/gencode.v45.basic.annotation.gtf.gz")
+
+get_protein_coding <- function(gtf_tab) {
+  gtf_tab |>
+    filter(type == "gene" & gene_type == "protein_coding") |>
+    select(gene_id, gene_name)
+}
+
+gencode45_genes <- get_protein_coding(gencode45_gtf)
+```
+
+## Read and prep data
+
+Data are from: `r datapath`
+
+### Count matrix (gene)
+
+```{r}
+#import count metrix
+cm_raw <- read_tsv("data/salmon.merged.gene_counts.tsv",
+                   col_types = cols(.default = "d",
+                                    gene_id = "c",
+                                    gene_name = "c"))
+
+# Ensure that the sample IDs in your sample sheet and the count matrix match
+#  modify this code to do so
+
+cm <- cm_raw
+
+head(cm)
+```
+
+### Sample sheet
+
+```{r}
+# getting data from path in minerva
+ss_raw <- 
+  file.path(datapath, "deg_samplesheet.csv") |>
+            read_csv(col_types = cols(.default = "c", RIN = "d"))
+
+ss_raw
+```
+
+```{r}
+# Turn categorical variables into factors
+
+proc_samples <- function(ss, bin_vars, grp, relevel) {
+  binary_vars <- unique(c(bin_vars, names(relevel)))
+  for (var in binary_vars) {
+    if (var %in% names(relevel)) {
+      ss[var] <- fct_relevel(ss[[var]], relevel[[var]])
+    } else {
+      ss[var] <- as_factor(ss[[var]])
+    }
+  }
+  for (group in grp) {
+    gname <- paste(group, collapse = "_")
+    ss <- ss |>
+      unite(!!gname, all_of(group), sep = ":", remove = FALSE) |>
+      mutate({{ gname }} := as_factor(!!sym(gname)))
+  }
+  out <- ss |>
+    mutate(sample = make.names(sample)) |>
+    column_to_rownames("sample")
+  ccols <- colnames(select_if(out, is.character))
+  if (length(ccols) > 0) {
+    warning(paste("The following columns are character, not factor: ", ccols))
+  }
+  return(out)
+}
+
+ss <- ss_raw |>
+  select(-APOE_siRNA, -APOE_siRNA_stim, -starts_with("fastq")) |>
+  proc_samples(bin_vars = c("APOE", "line", "siRNA", "stimulus", "expt"),
+               grp = list(c("APOE", "siRNA"), c("APOE", "siRNA", "stimulus"),
+                          c("line", "expt")),
+               relevel = list(siRNA = "SCR", stimulus = "none", APOE = "33"))
+
+ss
+```
+
+
+```{r}
+genenames <- cm |> select(gene_id, gene_name)
+
+head(genenames)
+```
+
+# Exploratory data analysis
+
+### Make edgeR DGE list for exploratory analysis
+
+Filter to expressed genes only
+
+```{r}
+make_dgelist <- function(ss, cm, genes, grp, norm_fun = calcNormFactors) {
+  cm_mat <- cm |>
+    semi_join(genes, by = "gene_id") |>
+    column_to_rownames("gene_id") |> 
+    select(rownames(ss)) |> 
+    as.matrix()
+
+  #normalize DGE by reads (whatever that is calculated by) across samples 
+  d_all <- DGEList(cm_mat)
+  d_all_norm <- norm_fun(d_all)
+  matdim <- list(samp = ncol(d_all))
+  matdim["all"] <- nrow(d_all)
+  #remove lowly expressed genes across samples, recalculate library size after removing genes
+  keep <- filterByExpr(d_all_norm, group = grp)
+  d <- d_all_norm[keep, , keep.lib.sizes = FALSE]
+  # should this be d <- d_all_norm[keep, , keep.lib.sizes = TRUE]? We need this if using CPM instead of just TMM
+  matdim["expr"] <- nrow(d)
+  
+  return(list(d = d, ss = ss, matrix_dims = matdim))
+}
+
+d_all <- ss |>
+  make_dgelist(cm, gencode45_genes, "APOE_siRNA_stimulus")
+```
+
+### Print MDS Plots
+
+```{r}
+extract_mds <- function(dmat, ss, n = 16) {
+  mds <- plotMDS(dmat, plot = FALSE)
+  eigenvec <- mds$eigen.vectors[seq_len(nrow(mds$eigen.vectors)), seq_len(n)]
+  eigenval <- mds$eigen.values[seq_len(n)]
+  md_tab <- {eigenvec %*% diag(sqrt(eigenval))} |>
+    as_tibble(.name_repair = \(n) paste0("MD", seq_along(n)))
+  md_tab_ss <- bind_cols(as_tibble(ss, rownames = "sample"), md_tab)
+  list(mds = md_tab_ss, var_explained = mds$var.explained[seq_len(n)])
+}
+mds <- extract_mds(d_all$d, d_all$ss)
+
+plot_mds <- function(mds, grp) {
+  pct <- round(mds$var_explained * 100)[1:2]
+  p <- mds$mds |>
+    ggplot(aes(x = MD1, y = MD2, text = sample, color = !!sym(grp))) +
+      geom_point() +
+      labs(title = grp,
+           x = sprintf("Leading logFC dim 1 (%i%%)", pct[1]),
+           y = sprintf("Leading logFC dim 2 (%i%%)", pct[2]))
+
+  ggplotly(p, tooltip = "text")
+}
+
+plot_mds_34 <- function(mds, grp) {
+  pct <- round(mds$var_explained * 100)[3:4]
+  p <- mds$mds |>
+    ggplot(aes(x = MD3, y = MD4, text = sample, color = !!sym(grp))) +
+      geom_point() +
+      labs(title = grp,
+           x = sprintf("Leading logFC dim 3 (%i%%)", pct[3]),
+           y = sprintf("Leading logFC dim 4 (%i%%)", pct[4]))
+
+  ggplotly(p, tooltip = "text")
+}
+```
+
+::: panel-tabset
+#### APOE
+
+```{r}
+plot_mds(mds, "APOE")
+```
+
+#### APOE upper MDs
+
+```{r}
+plot_mds_34(mds, "APOE")
+```
+
+#### siRNA
+
+```{r}
+plot_mds(mds, "siRNA")
+```
+
+#### siRNA upper MDs
+
+```{r}
+plot_mds_34(mds, "siRNA")
+```
+
+#### line
+
+```{r}
+plot_mds(mds, "line")
+```
+
+#### stimulus
+
+```{r}
+plot_mds(mds, "stimulus")
+```
+
+#### expt
+
+```{r}
+plot_mds(mds, "expt")
+```
+:::
+
+# Differential Gene Expression
+
+
+## Variance partition analysis
+
+```{r}
+#given all these factors, where the model attributes variance to, everything you dont explain will end up in the residuals and will determine the SEM 
+f <- ~ (1 | APOE) + (1 | siRNA) + (1 | stimulus) + (1 | line) + (1 | expt)
+vm_vp <- voomWithDreamWeights(d_all$d, f, d_all$ss, BPPARAM = bpparam())
+vp <- fitExtractVarPartModel(vm_vp, f,  d_all$ss, BPPARAM = bpparam())
+saveRDS(vp, "input/vp.rds")
+plotVarPart(sortCols(vp))
+```
+
+```{r}
+#given all these factors, where the model attributes variance to, everything you dont explain will end up in the residuals and will determine the SEM 
+f <- ~ (1 | APOE) + (1 | siRNA) + (1 | stimulus) + (1 | line_expt)
+vm_vp <- voomWithDreamWeights(d_all$d, f, d_all$ss, BPPARAM = bpparam())
+vp <- fitExtractVarPartModel(vm_vp, f,  d_all$ss, BPPARAM = bpparam())
+saveRDS(vp, "input/vp.rds")
+plotVarPart(sortCols(vp))
+```
+
+```{r}
+f_ne <- ~ (1 | APOE) + (1 | siRNA) + (1 | stimulus) + (1 | line)
+vm_vp_ne <- voomWithDreamWeights(d_all$d, f_ne, d_all$ss, BPPARAM = bpparam())
+vp_ne <- fitExtractVarPartModel(vm_vp, f_ne,  d_all$ss, BPPARAM = bpparam())
+saveRDS(vp_ne, "input/vp_ne.rds")
+plotVarPart(sortCols(vp_ne))
+```
+
+
+## Run Dream
+
+```{r}
+run_dream <- function(ss, f, contrasts, cm, genes, grp,
+                      norm_fun = calcNormFactors, fname = NULL) {
+  ss <- mutate(ss, across(where(is.factor), fct_drop))
+  if (!is.null(fname) && file.exists(fname)) return(read_rds(fname))
+  dgelist <- make_dgelist(ss, cm, genes, grp, norm_fun)
+  d <- dgelist[["d"]]
+  # Should we be using cpm(dgelist[["d"]]) instead of dgelist[["d"]]?
+  # transform count outcome variable to a continuous normally distributed
+  #  outcome variable to run it in GLM
+  message("Making voom matrix")
+  vm <- voomWithDreamWeights(d, f, ss, BPPARAM = bpparam())
+  # make DREAM contrasts
+  if (!is.null(contrasts)) {
+  message("Making dream contrasts")
+  cd <- makeContrastsDream(f, ss, contrasts = contrasts)
+  # do the actual fitting of the linear model, running LMR one for each gene
+  message("fitting model using dream")
+  fit_raw = dream(vm, f, ss, cd, BPPARAM = bpparam())
+  } else {
+    fit_raw = dream(vm, f, ss, BPPARAM = bpparam())
+    cd = NULL
+  }
+  # eBayes - for each gene looks for genes with similar expression level and
+  #  looks at its variance, looks for genes that varies much more than others
+  #  and moderates their effect, red flag outliers would be color-coded, plot
+  #  showing expression vs variance
+  message("applying bayesian shrinkage using Empirical Bayes")
+  fit = eBayes(fit_raw)
+  if (is.null(contrasts)) {
+    contrasts <- colnames(fit[["coefficients"]])
+    names(contrasts) <- contrasts
+    contrasts <- contrasts[contrasts != "rin"]
+  }
+  out <- list(inputs = list(ss = ss, cm = cm, f = f, contrasts = contrasts),
+              out = list(d = d, vm = vm, cd = cd, fit = fit, fit_raw = fit_raw,
+                         matrix_dims = dgelist$matrix_dims))
+  if (!is.null(fname)) write_rds(out, fname)
+  return(out)
+}
+
+dr_genotype <-
+  run_dream(ss, ~ 0 + APOE + siRNA + stimulus + RIN + (1 | line_expt),
+            c("APOE" = "APOE44 - APOE33"),
+            cm, gencode45_genes, "APOE_siRNA_stimulus",
+            fname = "output/dr_APOE.rds")
+
+dr_siRNA <-
+  run_dream(ss, ~ 0 + siRNA + APOE + stimulus + RIN + (1 | line_expt),
+            c("siRNA_EIF2B2" = "siRNAEIF2B2- siRNASCR",
+              "siRNA_EIF2B3" = "siRNAEIF2B3- siRNASCR"),
+            cm, gencode45_genes, "APOE_siRNA_stimulus",
+            fname = "output/dr_siRNA.rds")
+
+dr_stimulus <-
+  run_dream(ss, ~ 0 + stimulus + siRNA + APOE + RIN + (1 | line_expt),
+            c("stimulus" = "stimulusTHPG- stimulusnone"),
+            cm, gencode45_genes, "APOE_siRNA_stimulus",
+            fname = "output/dr_stim.rds")
+
+
+dr_APOE_siRNA <-
+  run_dream(ss, ~ 0 + APOE_siRNA + stimulus + RIN + (1 | line_expt),
+            c("APOE_EIF2B2" = "APOE_siRNA44:EIF2B2 - APOE_siRNA33:EIF2B2",
+              "APOE_EIF2B3" = "APOE_siRNA44:EIF2B3 - APOE_siRNA33:EIF2B3"),
+            cm, gencode45_genes, "APOE_siRNA_stimulus",
+            fname = "output/dr_APOExsiRNA.rds")
+
+dr_APOE_siRNA_stim <-
+  run_dream(ss, ~ 0 + APOE_siRNA_stimulus + RIN + (1 | line_expt),
+            c("APOE_EIF2B2_THPG" = "APOE_siRNA_stimulus44:EIF2B2:THPG - APOE_siRNA_stimulus33:EIF2B2:THPG",
+              "APOE_EIF2B3_THPG" = "APOE_siRNA_stimulus44:EIF2B3:THPG - APOE_siRNA_stimulus33:EIF2B3:THPG"),
+            cm, gencode45_genes, "APOE_siRNA_stimulus",
+            fname = "output/dr_APOExsiRNAxstim.rds")
+
+```
+
+```{r}
+plotSA(dr_genotype$out$fit)
+```
+
+```{r}
+plotSA(dr_siRNA$out$fit)
+```
+
+```{r}
+plotSA(dr_stimulus$out$fit)
+```
+```{r}
+plotSA(dr_APOE_siRNA$out$fit)
+```
+
+```{r}
+plotSA(dr_APOE_siRNA_stim$out$fit)
+```
+
+## GSEA
+
+```{r}
+dgea <- function(fit, coef, genenames, padj.cutoff = 1,
+                 out.dir = "output", write.xlsx = TRUE) {
+  if (is_tibble(fit)) {
+    res_unfilt <- fit |>
+      filter(contrast == coef)
+  } else {
+    res_initial <- topTable(fit, coef, n = Inf)
+    if (nrow(res_initial) == 0) return(NULL)
+    res_unfilt <- res_initial |> 
+      rownames_to_column("gene_id") |>
+      left_join(genenames, by = "gene_id")
+  }
+  res <- res_unfilt |>
+    select(gene_id, gene_name, everything()) |>
+    filter(adj.P.Val <= padj.cutoff) |>
+    arrange(P.Value)
+
+  if (write.xlsx) res |> write_xlsx(str_glue("{out.dir}/{coef}.dgea.xlsx"))
+  
+  return(res)
+}
+# Run GSEA on all of the contrasts within a DGE analysis
+gsea <- function(fit, coef, genenames, pathways, padj.cutoff = 1,
+                 in.dir = "input", out.dir = "output", write.xlsx = TRUE,
+                 perms = 1000) {
+  stats <- dgea(fit, coef, genenames)
+  if (is.null(stats)) return(NULL)
+  stats <- stats |>
+    arrange(P.Value) |>
+    distinct(gene_name, .keep_all = TRUE) |>
+    arrange(desc(t))
+  stats <- setNames(stats$t, stats$gene_name)
+  res <- gmtPathways(str_glue("{in.dir}/{pathways}.symbols.gmt")) |>
+    fgsea(stats, eps = 0, BPPARAM = bpparam(), nPermSimple = perms) |>
+    as_tibble() |> # because fgsea returns a data.table object!
+    filter(padj <= padj.cutoff) |>
+    arrange(pval)
+  
+  if (write.xlsx) res |> write_xlsx(str_glue("{out.dir}/{coef}.{pathways}.gsea.xlsx"))
+  
+  return(res)
+}
+gsea_all <- function(results, genesets, gn = genenames,
+                     padj.cutoff = 1, in.dir = "input", out.dir = "output",
+                     fname = NULL, write.xlsx = TRUE, perms = 1000) {
+
+  if (!is.null(fname) & file.exists(file.path(out.dir, fname))) {
+    return(read_rds(file.path(out.dir, fname)))
+  } else if (!is.null(fname) & file.exists(fname)) {
+    return(read_rds(fname))
+  }
+  
+  gsea_allpaths <- function(geneset, contrast, fit, genenames, padj.cutoff,
+                            in.dir, out.dir, write.xls, perms) {
+    gsea(fit, contrast, gn, geneset, padj.cutoff, in.dir, out.dir,
+         write.xlsx, perms) |>
+      arrange(pval) |>
+      mutate(geneset = geneset, contrast = contrast,
+             pathway = if_else(str_detect(geneset, "^h\\.all\\.v"),
+                               str_remove(str_replace_all(pathway, "_", " "),
+                                          "HALLMARK"),
+                               pathway))
+  }
+  gsea_res <- expand_grid(x = genesets, y = names(results$inputs$contrasts)) |>
+    future_pmap_dfr(\(x, y) gsea_allpaths(x, y, results$out$fit, gn, padj.cutoff,
+                                          in.dir, out.dir, write.xlsx, perms),
+                    .options = furrr_options(seed = TRUE))
+  out <- results
+  out$out$gsea <- gsea_res
+  if (!is.null(fname) & !str_detect(fname, "/")) {
+    write_rds(out, file.path(out.dir, fname))
+  } else if (!is.null(fname)) {
+    write_rds(out, fname)
+  }
+  out
+}
+
+# Specify which geneset files
+gset = c("c2andc5.all.v2024.1.Hs", "h.all.v2024.1.Hs")
+dr_genotype_gsea <- gsea_all(dr_genotype, gset, padj.cutoff = 1,
+                       fname = "gsea_genotype.rds",
+                       out.dir = "output",
+                       perms = 10000)
+
+dr_siRNA_gsea <- gsea_all(dr_siRNA, gset, padj.cutoff = 1,
+                       fname = "gsea_siRNA.rds",
+                       out.dir = "output",
+                       perms = 10000)
+
+dr_stimulus_gsea <- gsea_all(dr_stimulus, gset, padj.cutoff = 1,
+                       fname = "gsea_stimulus.rds",
+                       out.dir = "output",
+                       perms = 10000)
+
+dr_APOE_siRNA_gsea <- gsea_all(dr_APOE_siRNA, gset, padj.cutoff = 1,
+                       fname = "gsea_APOE_siRNA.rds",
+                       out.dir = "output",
+                       perms = 10000)
+
+dr_APOE_siRNA_stim_gsea <- gsea_all(dr_APOE_siRNA_stim, gset, padj.cutoff = 1,
+                       fname = "gsea_APOE_siRNA_stim.rds",
+                       out.dir = "output",
+                       perms = 10000)
+
+
+# alternative if you want the shiny without running GSEA
+make_tables <- \(result, out.dir) {
+    fit_in <- result[["out"]][["fit"]]
+    contrasts <- names(result[["inputs"]][["contrasts"]])
+    fit_out <- map(contrasts, \(ctrst) {
+      dgea(fit_in, ctrst, genenames, out.dir = out.dir) |>
+      arrange(P.Value) |>
+      dgea_label()
+    })
+    names(fit_out) <- contrasts
+    fit_out
+}
+```
+
+## Differential gene expression and gene set enrichment analyses
+
+```{r}
+#summary table of degs across contrasts
+summary(decideTests(dr_genotype$out$fit))
+```
+
+```{r}
+#summary table of degs across contrasts
+summary(decideTests(dr_siRNA$out$fit))
+```
+
+```{r}
+#summary table of degs across contrasts
+summary(decideTests(dr_stimulus$out$fit))
+```
+
+```{r}
+#summary table of degs across contrasts
+summary(decideTests(dr_APOE_siRNA$out$fit))
+```
+
+```{r}
+#summary table of degs across contrasts
+summary(decideTests(dr_APOE_siRNA_stim$out$fit))
+```
+
+```{r}
+res <- list("APOE" = dr_genotype_gsea,
+            "siRNA" = dr_siRNA_gsea,
+            "stimulus" = dr_stimulus_gsea,
+            "APOE_siRNA" = dr_APOE_siRNA_gsea,
+            "APOE_siRNA_stimulus" = dr_APOE_siRNA_stim_gsea) |>
+  map(\(result) {
+    fit_in <- result[["out"]][["fit"]]
+    contrasts <- names(result[["inputs"]][["contrasts"]])
+    fit_out <- map(contrasts, \(ctrst) {
+      dgea(fit_in, ctrst, genenames, write.xlsx = FALSE) |>
+      arrange(P.Value) |>
+      dgea_label()
+    })
+    names(fit_out) <- contrasts
+    result[["out"]][["fit"]] <- fit_out
+    if ("cd" %in% names(result[["out"]]) &&
+        "gsea" %in% names(result[["out"]])) {
+      result[["out"]] <- result[["out"]][c("fit", "gsea", "cd")]
+    } else if ("gsea" %in% names(result[["out"]])) {
+      result[["out"]] <- result[["out"]][c("fit", "gsea")]
+    } else if ("cd" %in% names(result[["out"]])) {
+      result[["out"]] <- result[["out"]][c("fit", "cd")]
+    } else {
+      result[["out"]] <- result[["out"]][c("fit")]
+    }
+    return(result)
+  })
+
+shiny_title <- "B2 B3 KD APOE pop lines RNASeq"
+write_rds(shiny_title, "shiny/title.rds")
+
+save(res, genenames, mds, file = "results.rda")
+R.utils::createLink("shiny/results.rda", "results.rda")
+```
+
+# Print environment
+
+```{r}
+sessioninfo::session_info()
+```
