@@ -153,7 +153,7 @@ head(cm)
 ```{r}
 # getting data from path in minerva
 ss_raw <- 
-  file.path(datapath, "deg_samplesheet.csv") |>
+  file.path("data/samplesheet.csv") |>
             read_csv(col_types = cols(.default = "c", RIN = "d"))
 
 ss_raw
@@ -317,6 +317,12 @@ plot_mds(mds, "stimulus")
 ```{r}
 plot_mds(mds, "expt")
 ```
+
+#### RIN
+
+```{r}
+plot_mds(mds, "RIN")
+```
 :::
 
 # Differential Gene Expression
@@ -417,7 +423,11 @@ dr_stimulus <-
 dr_APOE_siRNA <-
   run_dream(ss, ~ 0 + APOE_siRNA + stimulus + RIN + (1 | line_expt),
             c("APOE_EIF2B2" = "APOE_siRNA44:EIF2B2 - APOE_siRNA33:EIF2B2",
-              "APOE_EIF2B3" = "APOE_siRNA44:EIF2B3 - APOE_siRNA33:EIF2B3"),
+              "APOE_EIF2B3" = "APOE_siRNA44:EIF2B3 - APOE_siRNA33:EIF2B3",
+              "APOE33_EIF2B2" = "APOE_siRNA33:EIF2B2 - APOE_siRNA33:SCR",
+              "APOE33_EIF2B3" = "APOE_siRNA33:EIF2B3 - APOE_siRNA33:SCR",
+              "APOE44_EIF2B2" = "APOE_siRNA44:EIF2B2 - APOE_siRNA44:SCR",
+              "APOE44_EIF2B3" = "APOE_siRNA44:EIF2B3 - APOE_siRNA44:SCR"),
             cm, gencode45_genes, "APOE_siRNA_stimulus",
             fname = "output/dr_APOExsiRNA.rds")
 
@@ -441,6 +451,7 @@ plotSA(dr_siRNA$out$fit)
 ```{r}
 plotSA(dr_stimulus$out$fit)
 ```
+
 ```{r}
 plotSA(dr_APOE_siRNA$out$fit)
 ```
